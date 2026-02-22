@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenSCAD Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #f5f6f8;
+            color: #111;
+            overflow: hidden;
+        }
+        #viewer {
+            width: 100vw;
+            height: 100vh;
+        }
+        #status {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            padding: 8px 12px;
+            background: rgba(255,255,255,0.95);
+            color: #1f2937;
+            border: 1px solid #d2d6db;
+            border-radius: 6px;
+            font-size: 12px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+            z-index: 100;
+        }
+        #status.error { background: rgba(255, 235, 235, 0.95); color: #7f1d1d; border-color: #f3c2c2; }
+        #status.loading { background: rgba(237, 244, 255, 0.95); color: #1e3a8a; border-color: #c7d2fe; }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="viewer"></div>
+    <div id="status">Loading...</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ArcballControls } from 'three/addons/controls/ArcballControls.js';
+
+        const statusEl = document.getElementById('status');
+        const container = document.getElementById('viewer');
+
+        let scene, camera, renderer, controls, currentMesh, currentEdges;
+        let cameraState = null;
+
+        const DEFAULT_COLOR = [0.72, 0.72, 0.72, 1.0]; // neutral grey for unspecified faces
+        const LIGHT_BG = 0xf3f4f6;                     // light, low-contrast background
+        const GRID_MAJOR = 0x9aa4b2;                   // subtle major grid line
+        const GRID_MINOR = 0xd9dee5;                   // faint minor grid line
+        const EDGE_COLOR = 0x73808c;                   // soft edge overlay
+
+        function setStatus(msg, type = '') {
+            statusEl.textContent = msg;
+            statusEl.className = type;
+        }
+
+        // --- Color ergonomics -------------------------------------------------
+        const colorCache = new Map();
+        function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+        function rgbToHsl(r, g, b) {
+            const max = Math.max(r, g, b), min = Math.min(r, g, b);
+            let h, s, l = (max + min) / 2;
+            if (max === min) { h = s = 0; }
+            else {
+                const d = max - min;
+                s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+                switch (max) {
+                    case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+                    case g: h = (b - r) / d + 2; break;
+                    case b: h = (r - g) / d + 4; break;
+                }
+                h /= 6;
+            }
+            return [h, s, l];
+        }
+        function hslToRgb(h, s, l) {
+            if (s === 0) return [l, l, l];
+            const hue2rgb = (p, q, t) => {
+                if (t < 0) t += 1;
+                if (t > 1) t -= 1;
+                if (t < 1/6) return p + (q - p) * 6 * t;
+                if (t < 1/2) return q;
+                if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+                return p;
+            };
+            const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+            const p = 2 * l - q;
+            return [hue2rgb(p, q, h + 1/3), hue2rgb(p, q, h), hue2rgb(p, q, h - 1/3)];
+        }
+        // Adjust incoming vertex color to a softer, high-visibility palette
+        function adjustErgonomicColor(r, g, b) {
+            const key = `${(r*255)|0},${(g*255)|0},${(b*255)|0}`;
+            if (colorCache.has(key)) return colorCache.get(key);
+            let [h, s, l] = rgbToHsl(r, g, b);
+            // Reduce harsh saturation and bring lightness into a mid range
+            s = Math.min(s, 0.55);
+            l = clamp(l, 0.45, 0.75);
+            // Gentle lift for very dark colors
+            if (l < 0.5) l = l * 0.6 + 0.2;
+            const [rr, gg, bb] = hslToRgb(h, s, l);
+            const out = [rr, gg, bb];
+            colorCache.set(key, out);
+            return out;
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(LIGHT_BG);
+
+            camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 10000);
+            camera.position.set(100, 100, 100);
+            camera.up.set(0, 0, 1); // Z is up like OpenSCAD
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.0;
+            renderer.shadowMap.enabled = false; // softer, shadow-free CAD lighting
+            container.appendChild(renderer.domElement);
+
+            controls = new ArcballControls(camera, renderer.domElement, scene);
+            controls.cursorZoom = true;
+
+            // Lighting: soft, even illumination for CAD
+            // Hemi light for overall ambient (sky/ground)
+            const hemi = new THREE.HemisphereLight(0xf0f3f8, 0xb3b6b9, 0.9);
+            scene.add(hemi);
+            // Key + fill directionals to reveal form without harsh specular
+            const key = new THREE.DirectionalLight(0xffffff, 0.45);
+            key.position.set(1, 1, 2).multiplyScalar(200);
+            scene.add(key);
+            const fill = new THREE.DirectionalLight(0xffffff, 0.25);
+            fill.position.set(-2, -1, 1).multiplyScalar(120);
+            scene.add(fill);
+
+            // Axis helper
+            const axesHelper = new THREE.AxesHelper(50);
+            scene.add(axesHelper);
+
+            window.addEventListener('resize', onWindowResize);
+            animate();
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+
+        function saveCamera() {
+            cameraState = {
+                position: camera.position.clone(),
+                target: controls.target.clone()
+            };
+        }
+
+        function restoreCamera() {
+            if (cameraState) {
+                camera.position.copy(cameraState.position);
+                controls.target.copy(cameraState.target);
+            }
+        }
+
+        // Parse OFF format with colors
+        function parseOff(content) {
+            const lines = content.split('\n').map(line => line.trim()).filter(line => line.length > 0 && !line.startsWith('#'));
+            if (lines.length === 0) throw new Error('Empty OFF file');
+
+            let headerLine = 0;
+            if (lines[0] === 'OFF' || lines[0].startsWith('OFF ')) {
+                if (lines[0] === 'OFF') headerLine = 1;
+            }
+
+            const countLine = lines[0].startsWith('OFF ') ? lines[0].substring(4) : lines[headerLine];
+            const [numVertices, numFaces] = countLine.trim().split(/\s+/).map(Number);
+            const startLine = lines[0].startsWith('OFF ') ? 1 : headerLine + 1;
+
+            const vertices = [];
+            for (let i = 0; i < numVertices; i++) {
+                const parts = lines[startLine + i].split(/\s+/).map(Number);
+                vertices.push([parts[0], parts[1], parts[2]]);
+            }
+
+            const faces = [];
+            const faceColors = [];
+            const faceLine = startLine + numVertices;
+
+            for (let i = 0; i < numFaces; i++) {
+                const parts = lines[faceLine + i].split(/\s+/).map(Number);
+                const numVerts = parts[0];
+                const verts = parts.slice(1, numVerts + 1);
+
+                // Color: RGB or RGBA values 0-255 after vertex indices
+                let color = DEFAULT_COLOR;
+                if (parts.length >= numVerts + 4) {
+                    const colorParts = parts.slice(numVerts + 1);
+                    const r = colorParts[0] / 255;
+                    const g = colorParts[1] / 255;
+                    const b = colorParts[2] / 255;
+                    const a = colorParts.length >= 4 ? colorParts[3] / 255 : 1.0;
+                    color = [r, g, b, a];
+                }
+
+                // Triangulate polygon
+                for (let j = 1; j < verts.length - 1; j++) {
+                    faces.push([verts[0], verts[j], verts[j + 1]]);
+                    faceColors.push(color);
+                }
+            }
+
+            return { vertices, faces, faceColors };
+        }
+
+        // Create Three.js geometry from parsed OFF
+        function createGeometry(parsed) {
+            const geometry = new THREE.BufferGeometry();
+            const positions = [];
+            const colors = [];
+            const normals = [];
+
+            const vA = new THREE.Vector3();
+            const vB = new THREE.Vector3();
+            const vC = new THREE.Vector3();
+            const normal = new THREE.Vector3();
+
+            for (let i = 0; i < parsed.faces.length; i++) {
+                const [a, b, c] = parsed.faces[i];
+                const color = parsed.faceColors[i];
+
+                const pA = parsed.vertices[a];
+                const pB = parsed.vertices[b];
+                const pC = parsed.vertices[c];
+
+                positions.push(pA[0], pA[1], pA[2]);
+                positions.push(pB[0], pB[1], pB[2]);
+                positions.push(pC[0], pC[1], pC[2]);
+
+                // Ergonomic vertex color (preserve hue, desaturate/normalize lightness)
+                const [rr, gg, bb] = adjustErgonomicColor(color[0], color[1], color[2]);
+                colors.push(rr, gg, bb);
+                colors.push(rr, gg, bb);
+                colors.push(rr, gg, bb);
+
+                // Calculate face normal
+                vA.set(pA[0], pA[1], pA[2]);
+                vB.set(pB[0], pB[1], pB[2]);
+                vC.set(pC[0], pC[1], pC[2]);
+                normal.crossVectors(
+                    vB.clone().sub(vA),
+                    vC.clone().sub(vA)
+                ).normalize();
+
+                normals.push(normal.x, normal.y, normal.z);
+                normals.push(normal.x, normal.y, normal.z);
+                normals.push(normal.x, normal.y, normal.z);
+            }
+
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+
+            return geometry;
+        }
+
+        function disposeCurrent() {
+            if (currentEdges) {
+                scene.remove(currentEdges);
+                currentEdges.geometry.dispose();
+                currentEdges.material.dispose();
+                currentEdges = null;
+            }
+            if (currentMesh) {
+                scene.remove(currentMesh);
+                currentMesh.geometry.dispose();
+                currentMesh.material.dispose();
+                currentMesh = null;
+            }
+        }
+
+        function displayModel(offContent) {
+            try {
+                const parsed = parseOff(offContent);
+                const geometry = createGeometry(parsed);
+
+                disposeCurrent();
+
+                // Create material with vertex colors; soft, non-metallic
+                const material = new THREE.MeshStandardMaterial({
+                    vertexColors: true,
+                    side: THREE.DoubleSide,
+                    metalness: 0.0,
+                    roughness: 0.9,
+                    flatShading: true
+                });
+
+                currentMesh = new THREE.Mesh(geometry, material);
+                scene.add(currentMesh);
+
+                // Edge overlay to improve part readability on light background
+                const edgesGeom = new THREE.EdgesGeometry(geometry, 25);
+                const edgesMat = new THREE.LineBasicMaterial({ color: EDGE_COLOR, transparent: true, opacity: 0.5 });
+                currentEdges = new THREE.LineSegments(edgesGeom, edgesMat);
+                currentEdges.renderOrder = 1;
+                scene.add(currentEdges);
+
+                // Auto-fit camera on first load only
+                if (!cameraState) {
+                    const box = new THREE.Box3().setFromObject(currentMesh);
+                    const center = box.getCenter(new THREE.Vector3());
+                    const size = box.getSize(new THREE.Vector3());
+                    const maxDim = Math.max(size.x, size.y, size.z);
+                    const fov = camera.fov * (Math.PI / 180);
+                    const distance = maxDim / (2 * Math.tan(fov / 2)) * 1.35;
+
+                    controls.target.copy(center);
+                    camera.position.set(center.x + distance * 0.7, center.y + distance * 0.7, center.z + distance * 0.7);
+                }
+
+                setStatus('Ready');
+            } catch (err) {
+                setStatus('Error: ' + err.message, 'error');
+                console.error('Display error:', err);
+            }
+        }
+
+        async function loadAndRender() {
+            setStatus('Loading...', 'loading');
+            try {
+                const resp = await fetch('/api/model.off');
+                if (!resp.ok) {
+                    const error = await resp.text();
+                    throw new Error(error || 'Failed to fetch model');
+                }
+                const offContent = await resp.text();
+                saveCamera();
+                displayModel(offContent);
+                restoreCamera();
+            } catch (err) {
+                setStatus('Error: ' + err.message, 'error');
+                console.error('Load error:', err);
+            }
+        }
+
+        // WebSocket for live reload
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            ws.onopen = () => console.log('WebSocket connected');
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'reload') {
+                    loadAndRender();
+                } else if (data.type === 'error') {
+                    setStatus('Error: ' + data.message, 'error');
+                }
+            };
+            ws.onclose = () => {
+                console.log('WebSocket closed, reconnecting...');
+                setTimeout(connectWebSocket, 1000);
+            };
+            ws.onerror = () => console.error('WebSocket error');
+        }
+
+        init();
+        connectWebSocket();
+        loadAndRender();
+    </script>
+</body>
+</html>
