@@ -90,8 +90,7 @@ func renderToOFF() error {
 	cmd := exec.Command(openscadBin, scadFile, "-o", tmpPath, "--backend=manifold", "--export-format=off")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("OpenSCAD error: %s", string(output))
-		return fmt.Errorf("openscad failed: %w", err)
+		return fmt.Errorf("openscad error (%w): %s", err, string(output))
 	}
 
 	data, err := os.ReadFile(tmpPath)
@@ -171,10 +170,11 @@ func watchFile() {
 				}
 				lastEvent = time.Now()
 				log.Printf("File %s changed, re-rendering...", event.Name)
-				if err := renderToOFF(); err != nil {
+				err := renderToOFF()
+				if err != nil {
 					log.Printf("Render error: %v", err)
 				}
-				notifyClients()
+				notifyClients(err)
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -185,13 +185,21 @@ func watchFile() {
 	}
 }
 
-func notifyClients() {
+func notifyClients(err error) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 
-	msg, _ := json.Marshal(map[string]string{
-		"type": "reload",
-	})
+	var msg []byte
+	if err != nil {
+		msg, _ = json.Marshal(map[string]string{
+			"type":    "error",
+			"message": err.Error(),
+		})
+	} else {
+		msg, _ = json.Marshal(map[string]string{
+			"type": "reload",
+		})
+	}
 
 	for conn := range clients {
 		err := conn.WriteMessage(websocket.TextMessage, msg)
