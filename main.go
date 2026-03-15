@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,7 +53,7 @@ func main() {
 		log.Fatalf("File not found: %s", scadFile)
 	}
 
-	if err := renderToOFF(); err != nil {
+	if _, err := renderToOFF(); err != nil {
 		log.Printf("Initial render failed: %v", err)
 	}
 
@@ -75,27 +76,36 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-func renderToOFF() error {
+func renderToOFF() (string, error) {
+	var warning string
 	log.Println("Rendering...")
 	start := time.Now()
 
 	tmpFile, err := os.CreateTemp("", "openscad-*.off")
 	if err != nil {
-		return err
+		return warning, err
 	}
 	tmpPath := tmpFile.Name()
 	tmpFile.Close()
 	defer os.Remove(tmpPath)
 
 	cmd := exec.Command(openscadBin, scadFile, "-o", tmpPath, "--backend=manifold", "--export-format=off")
-	output, err := cmd.CombinedOutput()
+	o, err := cmd.CombinedOutput()
+	output := string(o)
 	if err != nil {
-		return fmt.Errorf("openscad error (%w): %s", err, string(output))
+		return warning, fmt.Errorf("openscad error (%w): %s", err, output)
+	}
+
+	// Collect warnings from OpenSCAD output, starting with "WARNING: "
+	for _, line := range strings.Split(output, "\n") {
+		if s, ok := strings.CutPrefix(line, "WARNING: "); ok {
+			warning += s + "\n"
+		}
 	}
 
 	data, err := os.ReadFile(tmpPath)
 	if err != nil {
-		return err
+		return warning, err
 	}
 
 	offMu.Lock()
@@ -103,7 +113,11 @@ func renderToOFF() error {
 	offMu.Unlock()
 
 	log.Printf("Rendered in %v (%d bytes)", time.Since(start).Round(time.Millisecond), len(data))
-	return nil
+	if warning != "" {
+		warning = strings.TrimSpace(warning)
+		log.Printf("WARNINGS:\n%s", warning)
+	}
+	return warning, nil
 }
 
 func handleOFF(w http.ResponseWriter, r *http.Request) {
@@ -170,11 +184,11 @@ func watchFile() {
 				}
 				lastEvent = time.Now()
 				log.Printf("File %s changed, re-rendering...", event.Name)
-				err := renderToOFF()
+				warn, err := renderToOFF()
 				if err != nil {
 					log.Printf("Render error: %v", err)
 				}
-				notifyClients(err)
+				notifyClients(warn, err)
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -185,7 +199,7 @@ func watchFile() {
 	}
 }
 
-func notifyClients(err error) {
+func notifyClients(warn string, err error) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 
@@ -197,7 +211,8 @@ func notifyClients(err error) {
 		})
 	} else {
 		msg, _ = json.Marshal(map[string]string{
-			"type": "reload",
+			"type":    "reload",
+			"warning": warn,
 		})
 	}
 

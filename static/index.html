@@ -30,6 +30,7 @@
             z-index: 100;
         }
         #status.error { background: rgba(255, 235, 235, 0.95); color: #7f1d1d; border-color: #f3c2c2; }
+        #status.warning { background: rgba(255, 250, 205, 0.95); color: #7f1d1d; border-color: #f3c2c2; }
         #status.loading { background: rgba(237, 244, 255, 0.95); color: #1e3a8a; border-color: #c7d2fe; }
     </style>
     <script type="importmap">
@@ -62,7 +63,9 @@
         const EDGE_COLOR = 0x73808c;                   // soft edge overlay
 
         function setStatus(msg, type = '') {
-            statusEl.textContent = msg;
+            // split msg into multiple lines if it contains newlines, and style each line separately
+            const lines = msg.split('\n');
+            statusEl.innerHTML = lines.map(line => `<div>${line}</div>`).join('');
             statusEl.className = type;
         }
 
@@ -342,10 +345,10 @@
             }
         }
 
-        async function loadAndRender() {
+        async function loadAndRender(warning) {
             setStatus('Loading...', 'loading');
             try {
-                const resp = await fetch('/api/model.off');
+                const resp = await fetch("/api/model.off");
                 if (!resp.ok) {
                     const error = await resp.text();
                     throw new Error(error || 'Failed to fetch model');
@@ -353,6 +356,10 @@
                 const offContent = await resp.text();
                 saveCamera();
                 displayModel(offContent);
+                if (warning) {
+                    console.warn('OpenSCAD warning:', warning);
+                    setStatus(warning, 'warning');
+                }
                 restoreCamera();
             } catch (err) {
                 setStatus('Error: ' + err.message, 'error');
@@ -369,7 +376,7 @@
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 if (data.type === 'reload') {
-                    loadAndRender();
+                    loadAndRender(data.warning);
                 } else if (data.type === 'error') {
                     setStatus('Error: ' + data.message, 'error');
                 }
